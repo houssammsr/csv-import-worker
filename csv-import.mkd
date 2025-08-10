@@ -1,0 +1,282 @@
+# CSV Import Implementation Plan (Offloaded via R2 + QStash + Worker)
+
+> Goal: Allow users to upload a CSV, infer column types (`string` vs `jsonb`), and save the data to Postgres tables `lists`, `list_columns`, and `list_rows` using Drizzle ORM — while avoiding Vercel timeouts and request body limits by offloading heavy work to a background worker. Client uploads the original CSV to Cloudflare R2 directly; a Render background worker consumes a QStash message to parse and persist in batches.
+
+---
+
+## 0 High-Level Workflow (Offloaded)
+
+1. User opens **Upload CSV** dialog.
+2. Browser parses first rows locally with **PapaParse** for metadata (headers, types, counts). No full-file upload to Vercel.
+3. Client requests a pre-signed PUT URL from a lightweight Vercel API route and uploads the original CSV directly to **Cloudflare R2**.
+4. Client enqueues a job via a lightweight Vercel API route which publishes a **QStash** message containing: `r2 {bucket, key}`, `listName`, `columns` (name/key/type/order), `firstRowIsHeader`, and `userId`.
+5. **Render worker** (HTTP endpoint) receives the QStash message, verifies signature, streams the CSV from R2, and performs the database import in batches with transactions.
+6. Worker writes progress and final status to **Upstash Redis** (or QStash callback URL to a Vercel route) keyed by `jobId`.
+7. Client polls status (or receives callback) and redirects to `/lists/[listId]` when completed.
+
+---
+
+## 1 Front-End — Upload & Parse (Client-Only for Metadata)
+
+### 1.1 Component
+
+`src/components/lists/upload-csv-dialog.tsx`
+
+- Shadcn `<Dialog>` containing:
+  - `<Input type="file" accept=".csv">`
+  - Progress / error state
+  - Checkbox: "First row contains column names" (checked by default)
+    - If checked: treat the first row as headers
+    - If unchecked: auto-generate headers as `Column 1`, `Column 2`, … based on detected column count
+  - On confirm: upload original file to R2 via pre-signed URL, then enqueue QStash job; never POST large CSV bodies to Vercel.
+
+### 1.2 Parsing Helper
+
+```ts
+import Papa from "papaparse";
+
+// Trims field values, and trims headers + strips BOM on first header.
+const stripBom = (h: string) => (h?.charCodeAt(0) === 0xfeff ? h.slice(1) : h);
+
+export const parseCsv = (file: File) =>
+  new Promise<{ data: Row[]; meta: Papa.ParseMeta }>((res, rej) => {
+    Papa.parse<Row>(file, {
+      header: true,
+      skipEmptyLines: true,
+      dynamicTyping: false, // we perform our own typing
+      transform: (v) => (typeof v === "string" ? v.trim() : v),
+      transformHeader: (h) => stripBom((h ?? "").trim()), // dedupe handled later
+      complete: ({ data, errors, meta }) =>
+        errors.length ? rej(errors[0]) : res({ data, meta }),
+    });
+  });
+```
+
+---
+
+## 2 Type-Inference Utility
+
+### 2.1 Parameters
+
+```
+SAMPLE_ROWS = 50             // max non-empty rows inspected per column
+PREVIEW_ROWS = 20            // number of rows rendered in AG Grid preview
+INSERT_BATCH_SIZE = 500      // rows per DB insert batch
+ACCEPTED_TYPES = ['string', 'jsonb']
+```
+
+### 2.2 Algorithm
+
+```ts
+type ColumnType = "string" | "jsonb";
+
+export function inferColumnTypes(
+  rows: Record<string, string>[],
+  sampleRows = SAMPLE_ROWS
+): Record<string, ColumnType> {
+  const out: Record<string, ColumnType> = {};
+  const headers = Object.keys(rows[0] ?? {});
+
+  headers.forEach((h) => {
+    out[h] = "string"; // default
+    for (let i = 0, counted = 0; i < rows.length && counted < sampleRows; i++) {
+      const raw = rows[i][h];
+      const v = typeof raw === "string" ? raw.trim() : raw;
+      if (!v) continue; // ignore empty
+      counted++;
+      // Short-circuit: only attempt JSON.parse if first non-space char is '{' or '['
+      const firstChar = v.match(/\S/)?.[0] as string | undefined;
+      if (firstChar !== "{" && firstChar !== "[") continue;
+      try {
+        const parsed = JSON.parse(v);
+        if (
+          parsed !== null &&
+          (Array.isArray(parsed) || typeof parsed === "object")
+        )
+          out[h] = "jsonb";
+        if (out[h] === "jsonb") break; // proven
+      } catch {
+        /* keep string */
+      }
+    }
+  });
+  return out;
+}
+```
+
+### 2.3 Generate Stable Keys
+
+`slugify(header) → key` (e.g. `Email Address` → `email_address`).
+
+---
+
+## 3 Upload to R2 + Enqueue Job
+
+- Client obtains a pre-signed PUT URL from a lightweight Vercel API route (Node or Edge runtime) that signs with R2 S3-compatible credentials.
+- Client uploads the original CSV directly to **Cloudflare R2** via `fetch(putUrl, { method: 'PUT', body: file, headers: { 'Content-Type': 'text/csv' } })`.
+- After successful upload, client calls a lightweight Vercel API route to enqueue a **QStash** job, passing only metadata and a pointer to the R2 object, including `firstRowIsHeader` and the finalized `columns` (names/keys/types/order). If `firstRowIsHeader` is false, `columns` should reflect generated names `Column 1…N`.
+
+---
+
+## 4 Payload Shapes
+
+```ts
+// Client → Vercel (enqueue) [small payload]
+interface EnqueuePayload {
+  jobId: string; // generated on client for idempotency
+  listName: string;
+  firstRowIsHeader: boolean;
+  columns: {
+    name: string;
+    key: string;
+    type: ColumnType; // 'string' | 'jsonb'
+    order: number;
+  }[];
+  r2: {
+    bucket: string;
+    key: string; // original CSV object key
+    contentType?: string; // 'text/csv'
+    size?: number;
+  };
+}
+
+// QStash message → Worker
+type WorkerMessage = EnqueuePayload & {
+  userId: string; // set by Vercel (requireUser())
+  requestedAt: string; // ISO
+};
+
+// Worker → Status store (Upstash Redis) value
+interface JobStatus {
+  jobId: string;
+  state: "queued" | "running" | "succeeded" | "failed";
+  listId?: string; // present when succeeded
+  error?: string; // present when failed
+  startedAt?: string;
+  finishedAt?: string;
+  processedRows?: number;
+}
+```
+
+---
+
+## 4.5 Database Connection — Worker Only (separate project)
+
+Keep the existing Vercel `db` instance (`neon-http`) for read-only. The heavy import runs exclusively in the **Render worker**, which can use WebSockets for interactive transactions without Vercel constraints.
+
+```ts
+// csv-import-worker/src/db.ts (Render)
+import { Pool, neonConfig } from "@neondatabase/serverless";
+import ws from "ws";
+import { drizzle } from "drizzle-orm/neon-serverless";
+import * as schema from "./schema";
+
+neonConfig.webSocketConstructor = ws; // Worker (Node) runtime
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+export const dbWs = drizzle({ client: pool, schema });
+```
+
+Notes:
+
+- No WebSockets on Vercel paths. Only the Render worker uses WS for transactions.
+- Keep `Pool` at module scope for reuse across invocations.
+
+---
+
+## 5 Worker — Persist to DB (QStash consumer, separate project)
+
+### 5.1 Location
+
+`csv-import-worker/src/index.ts` (Render HTTP endpoint), plus a thin publisher on Vercel: `src/app/api/lists/enqueue/route.ts`.
+
+### 5.2 Steps (Worker)
+
+- Verify QStash signature on the request.
+- Update `JobStatus` to `running`.
+- Stream CSV from Cloudflare R2 (S3-compatible SDK) using `{ bucket, key }` from the message.
+- Parse CSV in a streaming fashion (e.g., `papaparse` Node stream or `csv-parser`).
+  - If `firstRowIsHeader` is true: let the parser use the first row as headers (`headers: true`).
+  - If `firstRowIsHeader` is false: provide parser `headers: columns.map(c => c.name)` so all rows are treated as data and mapped to the generated header names.
+  - Open a transaction with `dbWs.transaction(async (tx) => { … })`:
+  1. Insert into `lists` (idempotency: if `jobId` has been processed, exit early).
+  2. Insert `list_columns` from the queued `columns` array.
+  3. For each row, build `dataObj` keyed by `col.key`, parsing JSON only when `col.type === 'jsonb'`.
+  4. Insert rows in batches of `INSERT_BATCH_SIZE` (500).
+- Commit.
+- Update `JobStatus` to `succeeded` with `listId`.
+- Optionally delete the R2 object to save storage.
+
+### 5.3 Return / Status
+
+- Worker responds 200 quickly to QStash.
+- Client polls `GET /api/lists/jobs/{jobId}` (Vercel) to get the status; on `succeeded`, redirect to `/lists/{listId}`.
+
+---
+
+## 6 List Detail Page
+
+- Route: `src/app/(dashboard)/lists/[listId]/page.tsx`
+- Loader fetches `list`, `list_columns` (ordered), `list_rows`.
+- Re-build `columnDefs` based on DB metadata.
+- `rowData = rows.map(r => ({ id: r.id, ...r.data }))`
+- Same grid component as preview for consistency.
+
+---
+
+## 7 Edge Cases & Limits Avoided
+
+- **Vercel 10s timeout** → avoided by offloading to worker.
+- **Vercel body limit** → avoided; client uploads to R2 directly.
+- **Large CSV** (>50 MB) → supported via direct-to-R2 upload and worker-side streaming.
+- **Duplicate headers** → auto-dedupe (`_2`, `_3`) & warn; persisted as provided by client metadata.
+- **Empty header** → assign `column_1`… and flag.
+- **Invalid JSON under `jsonb`** → worker rejects with detailed message and sets job to `failed`.
+- **Idempotency** → use `jobId` and/or dedupe key on list creation to prevent duplicate imports on retries.
+- **Security** →
+  - Verify QStash signature in worker.
+  - Restrict R2 presigned URL scope (content-type, max size, expiration).
+  - Require auth on Vercel enqueue route; include `userId` in message.
+  - Validate `columns` and `listName` length/charset on enqueue.
+
+---
+
+## 8 Testing Checklist
+
+- [ ] Upload small CSV → client-side summary matches source.
+- [ ] R2 upload succeeds; enqueue returns `jobId`.
+- [ ] Worker processes CSV and inserts lists/columns/rows in 500-row batches.
+- [ ] Status transitions: `queued` → `running` → `succeeded` with `listId`.
+- [ ] Invalid JSON under `jsonb` marks job `failed` with message.
+- [ ] Large CSV (e.g., 200MB) completes without Vercel timeouts/body-limit errors.
+- [ ] Idempotent re-delivery from QStash does not duplicate data.
+
+---
+
+## 9 New / Modified Files
+
+```
+src/components/lists/upload-csv-dialog.tsx            // UI + parsing + R2 upload + enqueue
+src/lib/csv/infer-column-types.ts                     // utility (unchanged API)
+
+// Vercel API (lightweight)
+src/app/api/uploads/r2-presign/route.ts               // returns presigned PUT URL (Edge or Node)
+src/app/api/lists/enqueue/route.ts                    // publishes QStash message (auth required)
+src/app/api/lists/jobs/[jobId]/route.ts               // returns JobStatus for polling
+
+// Worker (Render, separate repository/project root: csv-import-worker)
+csv-import-worker/src/index.ts                        // HTTP endpoint for QStash → kicks off import
+csv-import-worker/src/db.ts                           // WS Drizzle connection
+csv-import-worker/src/r2.ts                           // R2 S3 client to stream CSV
+
+src/db/drizzle-ws.ts                                   // optional: keep for local/worker use only
+src/app/(dashboard)/lists/[listId]/page.tsx           // list viewer (unchanged)
+```
+
+---
+
+## 10 Implementation Notes
+
+- Prefer streaming CSV parsing in the worker to keep memory low.
+- Use `INSERT_BATCH_SIZE = 500`; tune if needed.
+- Track progress by updating `processedRows` every N rows (e.g., 1k) in Upstash Redis.
+- Consider cleaning R2 objects after success to control storage costs.
