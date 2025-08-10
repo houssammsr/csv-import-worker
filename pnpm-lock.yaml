@@ -28,7 +28,7 @@ importers:
         version: 17.2.1
       drizzle-orm:
         specifier: ^0.44.4
-        version: 0.44.4(@neondatabase/serverless@1.0.1)(@types/pg@8.15.5)(@upstash/redis@1.35.3)
+        version: 0.44.4(@neondatabase/serverless@1.0.1)(@types/pg@8.15.5)(@upstash/redis@1.35.3)(kysely@0.28.5)
       express:
         specifier: ^5.1.0
         version: 5.1.0
@@ -1059,6 +1059,10 @@ packages:
 
   jose@5.10.0:
     resolution: {integrity: sha512-s+3Al/p9g32Iq+oqXxkW//7jk2Vig6FF1CFqzVXoTUXt2qz89YWbL+OwS17NFYEvxC35n0FKeGO2LGYSxeM2Gg==}
+
+  kysely@0.28.5:
+    resolution: {integrity: sha512-rlB0I/c6FBDWPcQoDtkxi9zIvpmnV5xoIalfCMSMCa7nuA6VGA3F54TW9mEgX4DVf10sXAWCF5fDbamI/5ZpKA==}
+    engines: {node: '>=20.0.0'}
 
   math-intrinsics@1.1.0:
     resolution: {integrity: sha512-/IXtbwEk5HTPyEwyKX6hGkYXxM9nbj64B+ilVJnC/R6B0pH5G4V3b0pVbL7DBj4tkhBAppbQUlf6F6Xl9LHu1g==}
@@ -2377,11 +2381,12 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  drizzle-orm@0.44.4(@neondatabase/serverless@1.0.1)(@types/pg@8.15.5)(@upstash/redis@1.35.3):
+  drizzle-orm@0.44.4(@neondatabase/serverless@1.0.1)(@types/pg@8.15.5)(@upstash/redis@1.35.3)(kysely@0.28.5):
     optionalDependencies:
       '@neondatabase/serverless': 1.0.1
       '@types/pg': 8.15.5
       '@upstash/redis': 1.35.3
+      kysely: 0.28.5
 
   dunder-proto@1.0.1:
     dependencies:
@@ -2571,6 +2576,9 @@ snapshots:
   is-promise@4.0.0: {}
 
   jose@5.10.0: {}
+
+  kysely@0.28.5:
+    optional: true
 
   math-intrinsics@1.1.0: {}
 
